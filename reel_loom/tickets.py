@@ -1,14 +1,57 @@
-import json
-from .errors import require, missing
-from .values import identifier, now, canonical, object_body, integer
+"""Render-ticket application service.
+
+This service is the single owner of each ticket business operation's SQLite
+transaction: enqueue, claim, cancel, failure, retry, startup recovery, rendition
+publication and the matrix's all-or-nothing enqueue. It asks `ticket_rules` for
+every decision and hands the outcome to `TicketStore`, which only records it.
+Reel/look/source freezing is a planning capability invoked here while the
+enqueue transaction is open; the persistence layer never resolves or edits
+reels, looks or source media.
+
+Publication is the whole commit for "encoded bytes become a rendition": the blob
+registration, the artifact row and the succeeded state are written in one
+transaction, so a cancellation observed in that transaction rolls all of them
+back. The renderer and the HTTP layer never re-open that transaction themselves.
+"""
+
+from . import ticket_rules
+from .errors import LoomError
+from .ticket_store import TicketStore
+from .values import identifier, now
 
 
 class Tickets:
-    def __init__(self, db, planner, keys):
-        self.db, self.planner, self.keys = db, planner, keys
+    def __init__(self, db, planner, keys, blobs):
+        self.db, self.planner, self.keys, self.blobs = db, planner, keys, blobs
+        self.store = TicketStore(db)
+
+    # -- reads --------------------------------------------------------------
+
+    def get(self, ticket_id, db=None):
+        if db is None:
+            with self.db.read() as read:
+                return self.store.load(read, ticket_id)
+        return self.store.load(db, ticket_id)
+
+    def list(self, state=None):
+        with self.db.read() as db:
+            return [self.store.load(db, ticket_id) for ticket_id in self.store.ids(db, state)]
+
+    def cancellation_requested(self, ticket_id):
+        with self.db.read() as db:
+            return self.store.cancellation_flag(db, ticket_id) is not False
+
+    def publishable(self, db, ticket_id):
+        """Read the publication decision inside the caller's transaction."""
+        stored = self.store.publish_state(db, ticket_id)
+        if stored is None:
+            raise LoomError("ticket_missing", "Render ticket disappeared", 409)
+        ticket_rules.require_publishable(*stored)
+
+    # -- enqueue ------------------------------------------------------------
 
     def enqueue(self, body, key=None):
-        object_body(body, ("reel", "revision", "look", "look_version"), ("reel", "look"))
+        ticket_rules.enqueue_body(body)
         with self.db.write_unit() as db:
             previous = self.keys.replay(db, "tickets", key, body)
             if previous:
@@ -16,97 +59,123 @@ class Tickets:
             snapshot = self.planner.freeze(db, body["reel"], body.get("revision"),
                                            body["look"], body.get("look_version"))
             ticket_id, created = identifier("render"), now()
-            db.execute("INSERT INTO tickets(id,reel,revision,look_id,look_version,snapshot,fingerprint,state,attempt,created,updated) "
-                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                       (ticket_id, snapshot["reel"], snapshot["revision"], snapshot["look"]["id"],
-                        snapshot["look"]["version"], canonical(snapshot), snapshot["fingerprint"], "queued", 1, created, created))
-            self.db.event(db, ticket_id, "queued", {"fingerprint": snapshot["fingerprint"]})
+            self.stage(db, snapshot, ticket_id, created)
             result = self.get(ticket_id, db)
             return self.keys.record(db, "tickets", key, body, result)
 
-    def get(self, ticket_id, db=None):
-        if db is None:
-            with self.db.read() as read:
-                return self.get(ticket_id, read)
-        row = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-        if row is None:
-            raise missing("render ticket", ticket_id)
-        result = dict(row)
-        result["snapshot"] = json.loads(result["snapshot"])
-        result["error"] = json.loads(result["error"]) if result["error"] else None
-        result["cancel"] = bool(result["cancel"])
-        result["artifacts"] = [dict(item) for item in db.execute(
-            "SELECT id,kind,blob,metadata FROM artifacts WHERE ticket=? ORDER BY created,id", (ticket_id,))]
-        for item in result["artifacts"]:
-            item["metadata"] = json.loads(item["metadata"])
-        return result
+    def stage(self, db, snapshot, ticket_id, created, event_kind="queued", payload=None):
+        """Add one frozen queued ticket inside a caller-owned transaction."""
+        self.store.insert_queued(db, ticket_id, snapshot, created, event_kind,
+                                 {"fingerprint": snapshot["fingerprint"]} if payload is None else payload)
+        return ticket_id
 
-    def list(self, state=None):
-        with self.db.read() as db:
-            if state:
-                rows = db.execute("SELECT id FROM tickets WHERE state=? ORDER BY created DESC,id LIMIT 100", (state,))
-            else:
-                rows = db.execute("SELECT id FROM tickets ORDER BY created DESC,id LIMIT 100")
-            return [self.get(row["id"], db) for row in rows]
+    def submit_matrix(self, body, key=None):
+        """Freeze every look and enqueue all members inside one transaction.
+
+        Validation happens before the write unit opens; any freeze or insertion
+        failure inside the unit rolls every member and its event back, so a
+        matrix is all queued or entirely absent.
+        """
+        looks = ticket_rules.matrix_body(body)
+        with self.db.write_unit() as db:
+            previous = self.keys.replay(db, "render_matrix", key, body)
+            if previous:
+                return previous
+            snapshots, identities = [], set()
+            for item in looks:
+                ticket_rules.matrix_entry(item)
+                snapshot = self.planner.freeze(db, body["reel"], body.get("revision"),
+                                               item["id"], item.get("version"))
+                identity = (snapshot["look"]["id"], snapshot["look"]["version"])
+                ticket_rules.register_look(identities, identity)
+                snapshots.append(snapshot)
+            batch_id, created, ids = identifier("matrix"), now(), []
+            for snapshot in snapshots:
+                ticket_id = identifier("render")
+                self.stage(db, snapshot, ticket_id, created, "matrix_queued",
+                           {"matrix": batch_id, "fingerprint": snapshot["fingerprint"]})
+                ids.append(ticket_id)
+            self.db.event(db, batch_id, "matrix_submitted", {"tickets": ids})
+            result = {"id": batch_id, "tickets": [self.get(x, db) for x in ids]}
+            return self.keys.record(db, "render_matrix", key, body, result)
+
+    # -- queue mutations ----------------------------------------------------
 
     def claim(self):
         with self.db.write_unit() as db:
-            row = db.execute("SELECT id FROM tickets WHERE state='queued' ORDER BY created,id LIMIT 1").fetchone()
-            if row is None:
+            ticket_id = self.store.next_queued(db, ticket_rules.QUEUE_ORDER)
+            if ticket_id is None:
                 return None
-            db.execute("UPDATE tickets SET state='running',updated=? WHERE id=? AND state='queued'", (now(), row["id"]))
-            self.db.event(db, row["id"], "started", {})
-            return self.get(row["id"], db)
-
-    def cancellation_requested(self, ticket_id):
-        with self.db.read() as db:
-            row = db.execute("SELECT cancel FROM tickets WHERE id=?", (ticket_id,)).fetchone()
-            return row is None or bool(row["cancel"])
+            # BEGIN IMMEDIATE excludes other writers, so the row read here is
+            # the row the update acts on; mark_started also keeps the
+            # queued->running predicate as a second line of defence.
+            ticket_rules.claimable(self.store.row(db, ticket_id)["state"])
+            if not self.store.mark_started(db, ticket_id, now()):
+                return None
+            self.db.event(db, ticket_id, "started", {})
+            return self.store.load(db, ticket_id)
 
     def progress(self, ticket_id, value):
         with self.db.write_unit() as db:
-            db.execute("UPDATE tickets SET progress=MAX(progress,?),updated=? WHERE id=? AND state='running'",
-                       (min(value, .99), now(), ticket_id))
+            self.store.set_progress(db, ticket_id, ticket_rules.capped_progress(value), now())
 
     def cancel(self, ticket_id):
         with self.db.write_unit() as db:
             ticket = self.get(ticket_id, db)
-            if ticket["state"] == "queued":
-                db.execute("UPDATE tickets SET state='cancelled',cancel=1,updated=? WHERE id=?", (now(), ticket_id))
-            elif ticket["state"] == "running":
-                db.execute("UPDATE tickets SET cancel=1,updated=? WHERE id=?", (now(), ticket_id))
-            else:
+            effect = ticket_rules.cancel_effect(ticket["state"])
+            if effect is ticket_rules.NO_EFFECT:
                 return ticket
+            moment = now()
+            if effect == ticket_rules.CANCEL_NOW:
+                self.store.mark_cancelled(db, ticket_id, moment)
+            else:
+                self.store.request_cancel(db, ticket_id, moment)
             self.db.event(db, ticket_id, "cancel_requested", {})
             return self.get(ticket_id, db)
 
     def fail(self, ticket_id, error):
         with self.db.write_unit() as db:
             ticket = self.get(ticket_id, db)
-            if ticket["state"] != "running":
+            state = ticket_rules.failure_state(ticket["state"], ticket["cancel"], error.code)
+            if state is ticket_rules.NO_EFFECT:
                 return ticket
-            state = "cancelled" if ticket["cancel"] or error.code == "render_cancelled" else "failed"
-            db.execute("UPDATE tickets SET state=?,error=?,updated=? WHERE id=?",
-                       (state, canonical(error.as_dict()), now(), ticket_id))
+            self.store.mark_failed(db, ticket_id, state, error.as_dict(), now())
             self.db.event(db, ticket_id, state, error.as_dict())
             return self.get(ticket_id, db)
 
     def retry(self, ticket_id):
         with self.db.write_unit() as db:
             ticket = self.get(ticket_id, db)
-            require(ticket["state"] in ("failed", "cancelled"), "retry_state", "Only failed or cancelled renders can retry", 409)
-            db.execute("UPDATE tickets SET state='queued',attempt=attempt+1,progress=0,cancel=0,error=NULL,updated=? WHERE id=?",
-                       (now(), ticket_id))
-            self.db.event(db, ticket_id, "retried", {"attempt": ticket["attempt"]+1})
+            attempt = ticket_rules.retry_attempt(ticket["state"], ticket["attempt"])
+            if not self.store.requeue(db, ticket_id, attempt, now()):
+                raise LoomError("retry_state", "Only failed or cancelled renders can retry", 409)
+            self.db.event(db, ticket_id, "retried", {"attempt": attempt})
             return self.get(ticket_id, db)
 
     def recover(self):
         with self.db.write_unit() as db:
-            rows = db.execute("SELECT id,cancel FROM tickets WHERE state='running'").fetchall()
-            for row in rows:
-                state = "cancelled" if row["cancel"] else "failed"
-                error = {"error": "worker_interrupted", "detail": "Previous worker stopped before committing output", "context": {}}
-                db.execute("UPDATE tickets SET state=?,error=?,updated=? WHERE id=?",
-                           (state, canonical(error), now(), row["id"]))
+            interrupted = 0
+            error = {"error": "worker_interrupted", "detail": "Previous worker stopped before committing output",
+                     "context": {}}
+            for row in self.store.running(db):
+                state = ticket_rules.recovery_state(row["state"], bool(row["cancel"]))
+                if state is ticket_rules.NO_EFFECT:
+                    continue
+                self.store.mark_recovered(db, row["id"], state, error, now())
                 self.db.event(db, row["id"], "recovered", {"state": state})
-            return {"interrupted": len(rows)}
+                interrupted += 1
+            return {"interrupted": interrupted}
+
+    # -- publication --------------------------------------------------------
+
+    def publish(self, ticket_id, path, metadata):
+        """Commit encoded output as the rendition and succeed the ticket."""
+        with self.db.write_unit() as db:
+            self.publishable(db, ticket_id)
+            blob = self.blobs.put(path, db)
+            artifact_id, created = identifier("artifact"), now()
+            self.store.insert_rendition(db, ticket_id, artifact_id, blob, metadata, created)
+            if not self.store.mark_succeeded(db, ticket_id, now()):
+                raise LoomError("ticket_state", "Only an active render can commit", 409)
+            self.db.event(db, ticket_id, "succeeded", {"artifact": artifact_id, "blob": blob["hash"]})
+            return self.store.load_artifact(db, artifact_id)

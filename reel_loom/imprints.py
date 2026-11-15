@@ -1,6 +1,7 @@
 import hashlib
 import json
 import zipfile
+from . import ticket_rules
 from .errors import require, missing
 from .values import identifier, now, canonical, digest, object_body
 
@@ -15,7 +16,7 @@ class Imprints:
         require(isinstance(track_ids, list) and len(track_ids) <= 64 and all(isinstance(x,str) for x in track_ids),
                 "invalid_tracks", "cue_tracks must be an array of identifiers")
         ticket = self.tickets.get(ticket_id)
-        require(ticket["state"] == "succeeded", "imprint_state", "Only completed renditions can be packaged", 409)
+        ticket_rules.require_packagable(ticket["state"])
         caption = self.captions.project(ticket["reel"], ticket["revision"], track_ids) if track_ids else None
         files = []
         for item in ticket["artifacts"]:

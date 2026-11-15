@@ -113,6 +113,16 @@
       "responsibility": "samples"
     },
     {
+      "id": "ticket_rules",
+      "path": "reel_loom/ticket_rules.py",
+      "responsibility": "ticket_rules"
+    },
+    {
+      "id": "ticket_store",
+      "path": "reel_loom/ticket_store.py",
+      "responsibility": "ticket_store"
+    },
+    {
       "id": "tickets",
       "path": "reel_loom/tickets.py",
       "responsibility": "tickets"
@@ -196,11 +206,13 @@
       ],
       "module_ids": [
         "api",
+        "artifacts",
         "planner",
-        "tickets",
-        "rendering",
         "processes",
-        "artifacts"
+        "rendering",
+        "ticket_rules",
+        "ticket_store",
+        "tickets"
       ]
     },
     {
@@ -316,10 +328,11 @@
       ],
       "module_ids": [
         "api",
-        "imprints",
-        "tickets",
+        "blobs",
         "captions",
-        "blobs"
+        "imprints",
+        "ticket_rules",
+        "tickets"
       ]
     },
     {
@@ -336,10 +349,12 @@
       ],
       "module_ids": [
         "api",
-        "tickets",
-        "rendering",
+        "artifacts",
         "processes",
-        "artifacts"
+        "rendering",
+        "ticket_rules",
+        "ticket_store",
+        "tickets"
       ]
     },
     {
@@ -356,10 +371,12 @@
       ],
       "module_ids": [
         "application",
+        "database",
         "instance",
-        "tickets",
         "rendering",
-        "database"
+        "ticket_rules",
+        "ticket_store",
+        "tickets"
       ]
     },
     {
@@ -398,9 +415,11 @@
       "module_ids": [
         "api",
         "batches",
+        "database",
         "planner",
-        "tickets",
-        "database"
+        "ticket_rules",
+        "ticket_store",
+        "tickets"
       ]
     },
     {

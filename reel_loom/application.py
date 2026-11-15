@@ -35,9 +35,9 @@ class Application:
             self.captions = Captions(self.db, self.assets, self.reels)
             self.planner = Planner(self.assets, self.reels, self.looks)
             self.processes = Processes(settings)
-            self.tickets = Tickets(self.db, self.planner, self.keys)
+            self.tickets = Tickets(self.db, self.planner, self.keys, self.blobs)
             self.artifacts = Artifacts(self.db, self.blobs)
-            self.batches = RenderBatches(self.db, self.planner, self.tickets, self.keys)
+            self.batches = RenderBatches(self.db, self.tickets)
             self.conformance = Conformance(settings, self.blobs, self.tickets, self.artifacts)
             self.lineage = Lineage(self.db, self.tickets)
             self.analysis = AudioAnalysis(self.db, self.assets, self.blobs, self.processes)
@@ -45,7 +45,7 @@ class Application:
             self.imprints = Imprints(self.db, self.blobs, self.tickets, self.captions)
             self.resources = Resources(self.db, self.blobs)
             self.recovery = self.tickets.recover()
-            self.renderer = Renderer(settings, self.blobs, self.tickets, self.planner, self.processes, self.artifacts)
+            self.renderer = Renderer(settings, self.blobs, self.tickets, self.planner, self.processes)
             if start_workers:
                 self.renderer.start()
         except BaseException:

@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 class Renderer:
-    def __init__(self, settings, blobs, tickets, planner, processes, artifacts):
+    def __init__(self, settings, blobs, tickets, planner, processes):
         self.settings, self.blobs, self.tickets = settings, blobs, tickets
-        self.planner, self.processes, self.artifacts = planner, processes, artifacts
+        self.planner, self.processes = planner, processes
         self.stopping = threading.Event()
         self.threads = []
 
@@ -31,7 +31,7 @@ class Renderer:
                 if abs(actual-duration) > tolerance:
                     raise LoomError("rendition_duration", "Encoded duration differs from the frozen reel", 422,
                                     {"expected": duration, "actual": actual})
-                return self.artifacts.commit_render(ticket_id, output, {**metadata, "fingerprint": ticket["fingerprint"]})
+                return self.tickets.publish(ticket_id, output, {**metadata, "fingerprint": ticket["fingerprint"]})
         except LoomError as exc:
             self.tickets.fail(ticket_id, exc)
             return None
